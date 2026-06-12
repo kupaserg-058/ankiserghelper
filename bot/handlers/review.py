@@ -1,23 +1,24 @@
 from aiogram import F, Router
-from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.keyboards.common import START_REVIEW
+from bot.keyboards.decks import DECK_PREFIX, decks_list_keyboard
+from bot.keyboards.main_menu import BTN_CARDS
 from bot.keyboards.review import (
-    ANSWER_PREFIX,
-    NEXT_CARD,
-    multiple_choice_keyboard,
-    next_card_keyboard,
+    GRADE_AGAIN,
+    GRADE_KNEW,
+    SHOW_ANSWER,
+    grade_keyboard,
+    show_answer_keyboard,
 )
 from bot.logger import get_logger
-from bot.models import Card, CardType, User
+from bot.models import User
 from bot.repositories.card_repo import get_card
-from bot.repositories.deck_repo import get_deck
+from bot.repositories.deck_repo import list_decks_with_card_count
 from bot.repositories.review_repo import apply_sm2_result, get_due_cards, get_review
 from bot.repositories.session_repo import finish_session, record_answer, start_session
-from bot.services import gemini
 from bot.services.sm2 import sm2
 from bot.states import Review
 
@@ -25,11 +26,23 @@ logger = get_logger(__name__)
 
 router = Router()
 
-CARD_TYPE_ICONS = {
-    CardType.flashcard: "🔁",
-    CardType.multiple_choice: "🔤",
-    CardType.open_question: "💬",
+GRADE_QUALITY = {
+    GRADE_AGAIN: 2,
+    GRADE_KNEW: 4,
 }
+
+
+@router.message(F.text == BTN_CARDS)
+async def show_review_decks(message: Message, session: AsyncSession, db_user: User) -> None:
+    decks = await list_decks_with_card_count(session, db_user.id)
+    if not decks:
+        await message.answer("У тебя пока нет колод. Создай первую в «📚 Мои колоды».")
+        return
+
+    await message.answer(
+        "Выбери колоду для повторения:",
+        reply_markup=decks_list_keyboard(decks, action_prefix=DECK_PREFIX),
+    )
 
 
 async def _start_review_session(
@@ -56,28 +69,14 @@ async def _start_review_session(
     await _show_next_card(message_target, state, session, db_user)
 
 
-@router.message(Command("review"))
-async def cmd_review(
-    message: Message,
-    command: CommandObject,
-    state: FSMContext,
-    session: AsyncSession,
-    db_user: User,
+@router.callback_query(F.data.startswith(f"{DECK_PREFIX}:"))
+async def callback_select_deck_for_review(
+    callback: CallbackQuery, state: FSMContext, session: AsyncSession, db_user: User
 ) -> None:
-    deck_id = None
-    if command.args:
-        try:
-            deck_id = int(command.args.strip())
-        except ValueError:
-            await message.answer("Используй: /review или /review <id колоды>")
-            return
-
-        deck = await get_deck(session, deck_id, db_user.id)
-        if deck is None:
-            await message.answer("Колода с таким id не найдена.")
-            return
-
-    await _start_review_session(message, state, session, db_user, deck_id)
+    deck_id = int(callback.data.split(":")[-1])
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await _start_review_session(callback.message, state, session, db_user, deck_id)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith(f"{START_REVIEW}:"))
@@ -109,14 +108,8 @@ async def _show_next_card(
         await _show_next_card(message_target, state, session, db_user)
         return
 
-    icon = CARD_TYPE_ICONS[card.card_type]
-
-    if card.card_type == CardType.multiple_choice:
-        text = f"{icon} <b>Вопрос:</b>\n{card.question}"
-        await message_target.answer(text, reply_markup=multiple_choice_keyboard(card.id, card.options))
-    else:
-        text = f"{icon} <b>Вопрос:</b>\n{card.question}\n\n✏️ Напиши свой ответ:"
-        await message_target.answer(text)
+    text = f"🔁 <b>Вопрос:</b>\n{card.question}"
+    await message_target.answer(text, reply_markup=show_answer_keyboard())
 
 
 async def _finish_review(message_target: Message, state: FSMContext, session: AsyncSession) -> None:
@@ -132,116 +125,67 @@ async def _finish_review(message_target: Message, state: FSMContext, session: As
         correct = review_session.correct_count
         await message_target.answer(
             f"🏁 Сессия завершена!\n\n"
-            f"Правильных ответов: {correct}/{total}\n\n"
+            f"Знал: {correct}/{total}\n\n"
             f"Карточки, которые ты не знал, появятся снова раньше — "
-            f"проверь /stats для общей статистики."
+            f"проверь «📊 Статистика» для общей информации."
         )
 
     await state.clear()
 
 
-async def _process_answer_result(
-    message_target: Message,
-    state: FSMContext,
-    session: AsyncSession,
-    db_user: User,
-    card: Card,
-    score: int,
-    feedback: str,
+@router.callback_query(Review.waiting_answer, F.data == SHOW_ANSWER)
+async def show_answer(
+    callback: CallbackQuery, state: FSMContext, session: AsyncSession, db_user: User
 ) -> None:
+    data = await state.get_data()
+    queue: list[int] = data["queue"]
+    if not queue:
+        await callback.answer()
+        return
+
+    card = await get_card(session, queue[0])
+    if card is None:
+        await callback.answer()
+        return
+
+    text = f"🔁 <b>Вопрос:</b>\n{card.question}\n\n💡 <b>Ответ:</b>\n{card.answer or '—'}"
+    await callback.message.edit_text(text, reply_markup=grade_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(Review.waiting_answer, F.data.in_(GRADE_QUALITY.keys()))
+async def process_grade(
+    callback: CallbackQuery, state: FSMContext, session: AsyncSession, db_user: User
+) -> None:
+    data = await state.get_data()
+    queue: list[int] = data["queue"]
+    if not queue:
+        await callback.answer()
+        return
+
+    card = await get_card(session, queue[0])
+    if card is None:
+        await callback.answer()
+        return
+
+    quality = GRADE_QUALITY[callback.data]
+
     review = await get_review(session, card.id, db_user.id)
     if review is not None:
-        result = sm2(score, review.ease_factor, review.interval, review.repetition)
+        result = sm2(quality, review.ease_factor, review.interval, review.repetition)
         await apply_sm2_result(session, review, result)
-        days = result.next_review_date
-    else:
-        days = None
 
-    data = await state.get_data()
     review_session_id = data.get("review_session_id")
     from bot.models import ReviewSession as ReviewSessionModel
 
     review_session = await session.get(ReviewSessionModel, review_session_id)
     if review_session is not None:
-        await record_answer(session, review_session, correct=score >= 3)
+        await record_answer(session, review_session, correct=quality >= 3)
 
-    next_review_text = f"\n\n📅 Следующее повторение: {days}" if days else ""
-    await message_target.answer(f"{feedback}{next_review_text}", reply_markup=next_card_keyboard())
+    await callback.message.edit_reply_markup(reply_markup=None)
 
-    queue: list[int] = data["queue"]
-    if queue and queue[0] == card.id:
-        queue.pop(0)
+    queue.pop(0)
     await state.update_data(queue=queue)
 
-
-@router.message(Review.waiting_answer, F.text)
-async def process_text_answer(
-    message: Message, state: FSMContext, session: AsyncSession, db_user: User
-) -> None:
-    data = await state.get_data()
-    queue: list[int] = data["queue"]
-    if not queue:
-        await _finish_review(message, state, session)
-        return
-
-    card = await get_card(session, queue[0])
-    if card is None or card.card_type == CardType.multiple_choice:
-        return
-
-    user_answer = message.text or ""
-
-    if card.card_type == CardType.flashcard:
-        result = await gemini.check_flashcard(card.question, card.answer or "", user_answer)
-        feedback = f"📊 Оценка: {result.score}/5 ({result.verdict})\n\n{result.explanation}"
-        score = result.score
-    else:
-        oq_result = await gemini.check_open_question(card.question, card.answer or "", user_answer)
-        missed = ""
-        if oq_result.missed_points:
-            missed = "\n\nУпущено:\n" + "\n".join(f"• {p}" for p in oq_result.missed_points)
-        feedback = f"📊 Оценка: {oq_result.score}/5\n\n{oq_result.feedback}{missed}"
-        score = oq_result.score
-
-    await _process_answer_result(message, state, session, db_user, card, score, feedback)
-
-
-@router.callback_query(Review.waiting_answer, F.data.startswith(f"{ANSWER_PREFIX}:"))
-async def process_multiple_choice_answer(
-    callback: CallbackQuery, state: FSMContext, session: AsyncSession, db_user: User
-) -> None:
-    _, card_id_str, choice_str = callback.data.split(":")[1:]
-    card_id = int(card_id_str)
-    choice = int(choice_str)
-
-    data = await state.get_data()
-    queue: list[int] = data["queue"]
-    if not queue or queue[0] != card_id:
-        await callback.answer()
-        return
-
-    card = await get_card(session, card_id)
-    if card is None:
-        await callback.answer()
-        return
-
-    await callback.message.edit_reply_markup(reply_markup=None)
-
-    if choice == card.correct_index:
-        score = 5
-        feedback = "✅ Верно!"
-    else:
-        score = 1
-        correct_option = card.options[card.correct_index]
-        feedback = f"❌ Неверно. Правильный ответ: {correct_option}"
-
-    await _process_answer_result(callback.message, state, session, db_user, card, score, feedback)
-    await callback.answer()
-
-
-@router.callback_query(Review.waiting_answer, F.data == NEXT_CARD)
-async def process_next_card(
-    callback: CallbackQuery, state: FSMContext, session: AsyncSession, db_user: User
-) -> None:
-    await callback.message.edit_reply_markup(reply_markup=None)
     await _show_next_card(callback.message, state, session, db_user)
     await callback.answer()

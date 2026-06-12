@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import tempfile
 import uuid
 
@@ -16,6 +17,18 @@ USER_AGENT = (
 )
 
 PDF_FALLBACK_SIZE_LIMIT = 20 * 1024 * 1024  # 20MB
+
+URL_PATTERN = re.compile(r"https?://\S+")
+YOUTUBE_PATTERN = re.compile(r"(youtube\.com|youtu\.be)")
+
+
+def extract_url(text: str) -> str | None:
+    match = URL_PATTERN.search(text)
+    return match.group(0) if match else None
+
+
+def is_video_url(url: str) -> bool:
+    return bool(YOUTUBE_PATTERN.search(url))
 
 
 async def fetch_url_text(url: str) -> str:

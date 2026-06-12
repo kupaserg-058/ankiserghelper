@@ -16,11 +16,16 @@ client = genai.Client(api_key=settings.google_api_key)
 
 
 class GeneratedCard(BaseModel):
-    card_type: Literal["flashcard", "multiple_choice", "open_question"]
     question: str
-    answer: str | None = None
-    options: list[str] | None = None
-    correct_index: int | None = None
+    answer: str | None
+
+
+class GeneratedTestQuestion(BaseModel):
+    question_type: Literal["multiple_choice", "open_question"]
+    question: str
+    answer: str | None
+    options: list[str] | None
+    correct_index: int | None
 
 
 class FlashcardCheckResult(BaseModel):
@@ -32,7 +37,7 @@ class FlashcardCheckResult(BaseModel):
 class OpenQuestionCheckResult(BaseModel):
     score: int
     feedback: str
-    missed_points: list[str] = []
+    missed_points: list[str]
 
 
 GENERATE_CARDS_PROMPT = """\
@@ -41,18 +46,31 @@ GENERATE_CARDS_PROMPT = """\
 Проанализируй приложенный материал и создай набор флеш-карточек для изучения.
 
 Правила:
-- Создавай 10-20 карточек на каждые ~1000 слов материала (минимум 5 карточек).
-- Распредели карточки по типам примерно так: 50% flashcard, 30% multiple_choice, 20% open_question.
+- Создай примерно {target_count} флеш-карточек по материалу.
 - Язык карточек должен совпадать с языком исходного материала.
 - Фокусируйся на ключевых концепциях и идеях, а не на второстепенных деталях.
-- Для flashcard: question — вопрос/термин, answer — краткий эталонный ответ.
+- question — вопрос/термин, answer — краткий эталонный ответ.
+
+Верни результат строго в виде JSON-массива карточек согласно схеме.
+"""
+
+GENERATE_TEST_PROMPT = """\
+Ты — ассистент для создания проверочных тестов на основе флеш-карточек.
+
+Вот список флеш-карточек (вопрос/ответ) из колоды:
+
+{cards_text}
+
+Создай на их основе набор тестовых вопросов:
+- Распредели вопросы по типам примерно так: 60% multiple_choice, 40% open_question.
+- Язык вопросов должен совпадать с языком исходных карточек.
 - Для multiple_choice: question — вопрос, options — ровно 4 варианта ответа,
   correct_index — индекс (0-3) правильного варианта, остальные три варианта
   должны быть правдоподобными, но неверными. Поле answer оставь пустым.
 - Для open_question: question — вопрос, требующий развёрнутого ответа,
   answer — эталонный развёрнутый ответ для последующей проверки.
 
-Верни результат строго в виде JSON-массива карточек согласно схеме.
+Верни результат строго в виде JSON-массива вопросов согласно схеме.
 """
 
 CHECK_FLASHCARD_PROMPT = """\
@@ -106,9 +124,10 @@ def _generate_content(contents: list, response_schema) -> str:
 async def generate_cards(
     text: str | None = None,
     file: types.File | None = None,
+    target_count: int = 20,
 ) -> list[GeneratedCard]:
     """Generate flashcards either from raw text or an uploaded Gemini file."""
-    contents: list = [GENERATE_CARDS_PROMPT]
+    contents: list = [GENERATE_CARDS_PROMPT.format(target_count=target_count)]
     if file is not None:
         contents.append(file)
     if text is not None:
@@ -116,6 +135,14 @@ async def generate_cards(
 
     raw = await asyncio.to_thread(_generate_content, contents, list[GeneratedCard])
     return _parse_list(raw, GeneratedCard)
+
+
+async def generate_test_questions(cards: list[tuple[str, str]]) -> list[GeneratedTestQuestion]:
+    """Generate multiple_choice/open_question test items from a deck's flashcards."""
+    cards_text = "\n".join(f"- Вопрос: {q}\n  Ответ: {a}" for q, a in cards)
+    prompt = GENERATE_TEST_PROMPT.format(cards_text=cards_text)
+    raw = await asyncio.to_thread(_generate_content, [prompt], list[GeneratedTestQuestion])
+    return _parse_list(raw, GeneratedTestQuestion)
 
 
 async def check_flashcard(question: str, reference: str, user_answer: str) -> FlashcardCheckResult:

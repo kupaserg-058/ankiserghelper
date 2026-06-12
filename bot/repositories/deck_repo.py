@@ -35,3 +35,8 @@ async def list_decks_with_card_count(session: AsyncSession, user_id: int) -> lis
 async def count_decks(session: AsyncSession, user_id: int) -> int:
     result = await session.execute(select(func.count(Deck.id)).where(Deck.user_id == user_id))
     return result.scalar_one()
+
+
+async def delete_deck(session: AsyncSession, deck: Deck) -> None:
+    await session.delete(deck)
+    await session.commit()

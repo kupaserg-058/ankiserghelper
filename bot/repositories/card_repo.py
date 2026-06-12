@@ -15,9 +15,7 @@ async def bulk_create_cards(session: AsyncSession, deck_id: int, cards: list[Gen
                 deck_id=deck_id,
                 question=c.question,
                 answer=c.answer,
-                card_type=CardType(c.card_type),
-                options=c.options,
-                correct_index=c.correct_index,
+                card_type=CardType.flashcard,
             )
         )
     session.add_all(db_cards)
@@ -47,3 +45,23 @@ async def count_cards(session: AsyncSession, deck_id: int) -> int:
 async def get_card(session: AsyncSession, card_id: int) -> Card | None:
     result = await session.execute(select(Card).where(Card.id == card_id))
     return result.scalar_one_or_none()
+
+
+async def get_cards_by_deck(session: AsyncSession, deck_id: int) -> list[Card]:
+    result = await session.execute(select(Card).where(Card.deck_id == deck_id).order_by(Card.id))
+    return list(result.scalars().all())
+
+
+async def delete_card(session: AsyncSession, card: Card) -> None:
+    await session.delete(card)
+    await session.commit()
+
+
+async def update_card_question(session: AsyncSession, card: Card, question: str) -> None:
+    card.question = question
+    await session.commit()
+
+
+async def update_card_answer(session: AsyncSession, card: Card, answer: str) -> None:
+    card.answer = answer
+    await session.commit()

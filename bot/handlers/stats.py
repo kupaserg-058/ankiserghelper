@@ -1,17 +1,17 @@
 from datetime import date
 
-from aiogram import Router
-from aiogram.filters import Command
+from aiogram import F, Router
 from aiogram.types import Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot.keyboards.main_menu import BTN_STATS
 from bot.models import Card, CardReview, Deck, ReviewSession, User
 
 router = Router()
 
 
-@router.message(Command("stats"))
+@router.message(F.text == BTN_STATS)
 async def cmd_stats(message: Message, session: AsyncSession, db_user: User) -> None:
     decks_count = await session.scalar(
         select(func.count(Deck.id)).where(Deck.user_id == db_user.id)
